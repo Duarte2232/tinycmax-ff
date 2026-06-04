@@ -42,6 +42,7 @@ class Train(LightningModule):
 
         # initialize lazy modules
         if stage == "fit":
+            self.network.to(self.device)
             with torch.no_grad():
                 input = DotMap(
                     events=torch.zeros(self.trainer.datamodule.train_frame_shape, device=self.device), _dynamic=False
