@@ -112,7 +112,9 @@ class MvsecSequence:
 
         # each dataset item = n_stack consecutive windows stacked into [2*n_stack, H, W]
         # seq_len still controls how many total windows are cut from each random clip
-        self.chunk_map = batched(range(len(self.t_start)), self.n_stack)
+        # drop_last=True ensures every chunk has exactly n_stack windows; the tail
+        # (up to n_stack-1 windows) is discarded rather than producing a short stack
+        self.chunk_map = batched(range(len(self.t_start)), self.n_stack, drop_last=True)
 
     def init_slice(self):
         # start and end time
