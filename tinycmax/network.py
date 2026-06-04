@@ -1,12 +1,12 @@
 import torch.nn as nn
 
-from tinycmax.blocks import conv_encoder, LazyConvGru, upsample_decoder
-from tinycmax.network_utils import NetworkWrapper
+from tinycmax.blocks import conv_encoder, upsample_decoder
 
 
 class FlowNetwork(nn.Module):
     """
-    Optical flow prediction network following IDNet (Wu et al., ICRA'24).
+    Feedforward optical flow prediction network.
+    Input: stacked event frames [B, 2*N, H, W]; output: flow map [B, 2, H, W].
     """
 
     mode = "flow"
@@ -26,21 +26,18 @@ class FlowNetwork(nn.Module):
         self.scaling = scaling
 
         self.encoder = conv_encoder(encoder_channels, activation_fn, padding_mode=padding_mode)
-        self.memory = LazyConvGru(memory_channels, 3, padding_mode=padding_mode)
+        self.memory = nn.Sequential(
+            nn.Conv2d(memory_channels, memory_channels, kernel_size=3, padding=1, padding_mode=padding_mode),
+            activation_fn(),
+        )
         self.decoder = upsample_decoder(
             decoder_channels, activation_fn, final_bias, padding_mode=padding_mode, mode=self.mode
         )
 
-    def forward(self, input, hidden=None):
-        frame = input["events"]  # .events incompatible with torch.compile?
+    def forward(self, input):
+        frame = input["events"]
         encoder = self.encoder(frame)
-        memory = self.memory(encoder, hidden)
+        memory = self.memory(encoder)
         flow_map = self.decoder(memory)
-
         flow_map *= self.scaling
-
-        return dict(flow=flow_map), memory
-
-
-class WrappedFlowNetwork(NetworkWrapper, FlowNetwork):
-    pass
+        return dict(flow=flow_map)

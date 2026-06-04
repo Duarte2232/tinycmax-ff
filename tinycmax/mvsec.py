@@ -13,6 +13,7 @@ from lightning import LightningDataModule
 import numpy as np
 from numpy.lib import recfunctions as rfn
 import torch
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import ConcatDataset, DataLoader
 import yaml
 
@@ -20,8 +21,6 @@ from tinycmax.data_utils import (
     batched,
     ConcatBatchSampler,
     InfiniteDataLoader,
-    only_add_batch_dim,
-    time_first_collate,
 )
 
 
@@ -38,6 +37,7 @@ class MvsecSequence:
     rectify: bool = False
     augmentations: list[str] | None = None
     gt: list[str] | None = None
+    n_stack: int = 5  # consecutive windows to stack into one [2*n_stack, H, W] sample
 
     def __post_init__(self):
         # checks
@@ -110,10 +110,9 @@ class MvsecSequence:
             self.crop_corners[3] - self.crop_corners[1],
         )
 
-        # mapping from chunks to single slices
-        # match seq_len if given
-        self.chunk_size = self.seq_len if self.seq_len is not None else self.chunk_size
-        self.chunk_map = batched(range(len(self.t_start)), self.chunk_size)
+        # each dataset item = n_stack consecutive windows stacked into [2*n_stack, H, W]
+        # seq_len still controls how many total windows are cut from each random clip
+        self.chunk_map = batched(range(len(self.t_start)), self.n_stack)
 
     def init_slice(self):
         # start and end time
@@ -165,12 +164,19 @@ class MvsecSequence:
         # get new random slice, crop, augmentations
         self.reset()
 
-        # get chunk
+        # chunk = n_stack consecutive window indices
         chunk = self.chunk_map[idx]
+        n = len(chunk)
 
-        # go over slices
-        frames, auxs, targets = [], DotMap(), DotMap()
-        for i in chunk:
+        # crop corners are the same for every window in this item
+        top, left, bottom, right = self.crop_corners
+
+        # structured dtype for event lists (defined once)
+        dtype = np.dtype([("t", np.float64), ("y", np.float32), ("x", np.float32), ("p", np.int8)])
+
+        # collect per-window frames and event lists
+        frame_list, lst_list, count_list = [], [], []
+        for k, i in enumerate(chunk):
             # convert to indices (from us to s again)
             start = bisect_left(self.fs["data"]["davis/left/events"], self.t_start[i] / 1e6, key=lambda x: x[2])
             end = bisect_left(self.fs["data"]["davis/left/events"], self.t_end[i] / 1e6, key=lambda x: x[2])
@@ -188,7 +194,6 @@ class MvsecSequence:
                 x_rect, y_rect = x, y
 
             # list of events to structured array
-            dtype = np.dtype([("t", np.float64), ("y", np.float32), ("x", np.float32), ("p", np.int8)])
             lst = np.empty(len(t), dtype=dtype)
             lst["t"] = t
             lst["y"] = y_rect
@@ -196,7 +201,6 @@ class MvsecSequence:
             lst["p"] = p
 
             # crop list
-            top, left, bottom, right = self.crop_corners
             mask = (y_rect >= top) & (y_rect < bottom) & (x_rect >= left) & (x_rect < right)
             lst = lst[mask]
             lst["y"] -= top
@@ -204,14 +208,13 @@ class MvsecSequence:
 
             # make into event count frame
             # use unrectified coordinates, convert p to {0, 1}
-            y = torch.from_numpy(y.astype(np.int64))
-            x = torch.from_numpy(x.astype(np.int64))
-            p = torch.from_numpy(((p + 1) // 2).astype(np.int64))
-            frame = torch.zeros(2, *self.sensor_size, dtype=torch.int64)  # torch is faster
-            frame.index_put_((p, y, x), torch.ones_like(p), accumulate=True)
+            y_t = torch.from_numpy(y.astype(np.int64))
+            x_t = torch.from_numpy(x.astype(np.int64))
+            p_t = torch.from_numpy(((p + 1) // 2).astype(np.int64))
+            frame = torch.zeros(2, *self.sensor_size, dtype=torch.int64)
+            frame.index_put_((p_t, y_t, x_t), torch.ones_like(p_t), accumulate=True)
 
             # rectify frame: backward rectification
-            # backward to prevent lines in frames
             if self.rectify:
                 frame = cv2.remap(
                     frame.numpy().transpose(1, 2, 0), self.bw_rect_map, None, interpolation=cv2.INTER_NEAREST
@@ -223,61 +226,64 @@ class MvsecSequence:
 
             # discard if few events or same timestamp
             if len(lst) < 10 or lst["t"][-1] == lst["t"][0]:
-                lst = np.array([], dtype=lst.dtype)
+                lst = np.array([], dtype=dtype)
                 frame = torch.zeros_like(frame)
 
-            # format list of events
-            # after cropping, else normalized timestamp not correct
-            # only normalize time; polarity is already in {-1, 1}
-            lst["t"] = (lst["t"] - lst["t"][0]) / (lst["t"][-1] - lst["t"][0]) if len(lst) else lst["t"]
+            # normalize time within window [0, 1], then place in global slot [k/n, (k+1)/n]
+            if len(lst):
+                lst["t"] = (lst["t"] - lst["t"][0]) / (lst["t"][-1] - lst["t"][0])
+                lst["t"] = (lst["t"] + k) / n
 
-            # append
-            frames.append(frame)
-            auxs.events += [lst]
-            auxs.counts += [len(lst)]
+            frame_list.append(frame)
+            lst_list.append(lst)
+            count_list.append(len(lst))
 
-            # targets
+        # stack n 2-channel frames along channel dim → [2*n, H, W]
+        frames = torch.cat(frame_list, dim=0).float()
 
-            # TODO: flow (and visualization)
+        # concatenate events from all n windows; timestamps are globally in [0, 1]
+        non_empty = [l for l in lst_list if len(l) > 0]
+        all_events = np.concatenate(non_empty) if non_empty else np.array([], dtype=dtype)
+        total_count = sum(count_list)
+        events_np = rfn.structured_to_unstructured(all_events, dtype=np.float32) if len(all_events) else np.zeros((0, 4), np.float32)
+        events_tensor = torch.tensor(events_np)  # [total_count, 4]
+        counts_tensor = torch.tensor(total_count)
 
-            # depth
-            if self.gt and "depth" in self.gt:
-                start = bisect_left(self.fs["gt"]["davis/left/depth_image_rect_ts"], self.t_start[i] / 1e6)
-                end = bisect_left(self.fs["gt"]["davis/left/depth_image_rect_ts"], self.t_end[i] / 1e6)
-                if start >= end:
-                    end = start + 1  # take latest
-                gt_depth_id = start + 1  # to prevent 0
-                gt_depth = self.fs["gt"]["davis/left/depth_image_rect"][start:end]  # keep time dim as channel
-                gt_depth = gt_depth[..., top:bottom, left:right]  # crop
-                gt_depth[np.isnan(gt_depth)] = 0  # replace nans with 0
-                targets.depth += [torch.from_numpy(gt_depth.astype(np.float32))]
-                targets.depth_id += [torch.tensor(gt_depth_id)]
+        # targets — use the last window's depth ground truth
+        targets = DotMap(_dynamic=False)
+        if self.gt and "depth" in self.gt:
+            i = chunk[-1]
+            gt_start = bisect_left(self.fs["gt"]["davis/left/depth_image_rect_ts"], self.t_start[i] / 1e6)
+            gt_end = bisect_left(self.fs["gt"]["davis/left/depth_image_rect_ts"], self.t_end[i] / 1e6)
+            if gt_start >= gt_end:
+                gt_end = gt_start + 1
+            gt_depth_id = gt_start + 1
+            gt_depth = self.fs["gt"]["davis/left/depth_image_rect"][gt_start:gt_end]
+            gt_depth = gt_depth[..., top:bottom, left:right]
+            gt_depth[np.isnan(gt_depth)] = 0
+            targets.depth = torch.from_numpy(gt_depth.astype(np.float32))
+            targets.depth_id = torch.tensor(gt_depth_id)
 
-        # stack and pad
-        frames = torch.stack(frames)
-        max_len = max(auxs.counts)
-        auxs.events = rfn.structured_to_unstructured(
-            np.stack([np.pad(e, (0, max_len - len(e))) for e in auxs.events]), dtype=np.float32
-        )
-        auxs = DotMap({k: torch.tensor(v) for k, v in auxs.items()}, _dynamic=False)  # convert to static dotmap
-        targets = DotMap({k: torch.stack(v) for k, v in targets.items()}, _dynamic=False)
-
-        # apply augmentations; more efficient on chunks
-        # not used with targets, so leave those out
+        # apply augmentations
+        fh, fw = frames.shape[1], frames.shape[2]
         if "flip_t" in self.augmentation:
-            frames = frames.flip(0)
-            auxs.events[..., 0] = 1 - auxs.events[..., 0]
-            auxs.events = auxs.events.flip(0)
-            auxs.counts = auxs.counts.flip(0)
+            # reverse order of the n stacked 2-channel pairs
+            frames = frames.reshape(n, 2, fh, fw).flip(0).reshape(2 * n, fh, fw)
+            if events_tensor.shape[0] > 0:
+                events_tensor[:, 0] = 1.0 - events_tensor[:, 0]
         if "flip_pol" in self.augmentation:
-            frames = frames.flip(1)
-            auxs.events[..., 3] *= -1
+            # swap positive/negative channels within each pair
+            frames = frames.reshape(n, 2, fh, fw).flip(1).reshape(2 * n, fh, fw)
+            if events_tensor.shape[0] > 0:
+                events_tensor[:, 3] *= -1
         if "flip_ud" in self.augmentation:
-            frames = frames.flip(2)
-            auxs.events[..., 1] = (bottom - top - 1) - auxs.events[..., 1]
+            frames = frames.flip(1)
+            if events_tensor.shape[0] > 0:
+                events_tensor[:, 1] = (bottom - top - 1) - events_tensor[:, 1]
         if "flip_lr" in self.augmentation:
-            frames = frames.flip(3)
-            auxs.events[..., 2] = (right - left - 2) - auxs.events[..., 2]
+            frames = frames.flip(2)
+            if events_tensor.shape[0] > 0:
+                events_tensor[:, 2] = (right - left - 2) - events_tensor[:, 2]
 
         # adapt camera matrices to crop and augmentations
         K_rect = self.K_rect.copy()
@@ -291,19 +297,47 @@ class MvsecSequence:
         K_rect = torch.from_numpy(K_rect.astype(np.float32))
         inv_K_rect = torch.from_numpy(inv_K_rect.astype(np.float32))
 
-        # return static dotmap
-        sample = DotMap(
-            frames=frames.float(),
-            auxs=auxs,
+        return DotMap(
+            frames=frames,
+            auxs=DotMap(events=events_tensor, counts=counts_tensor, _dynamic=False),
             targets=targets,
             recording=self.recording,
-            eofs=[i == len(self.t_start) - 1 for i in chunk],
             K_rect=K_rect,
             inv_K_rect=inv_K_rect,
             _dynamic=False,
         )
 
-        return sample
+
+def _feedforward_collate(batch):
+    """Collate for feedforward model.
+
+    Input:  list of B DotMaps, each with frames [2*N, H, W] and events [E_i, 4].
+    Output: DotMap with frames [B, 2*N, H, W] and events padded to [B, E_max, 4].
+    """
+    frames = torch.stack([s.frames for s in batch])  # [B, 2*N, H, W]
+
+    # pad variable-length event lists to the longest in the batch
+    events_list = [s.auxs.events for s in batch]
+    max_n = max(e.shape[0] for e in events_list)
+    if max_n > 0:
+        events = pad_sequence(events_list, batch_first=True)  # [B, E_max, 4]
+    else:
+        events = torch.zeros(len(batch), 0, 4)
+    counts = torch.stack([s.auxs.counts for s in batch])  # [B]
+
+    targets = DotMap(_dynamic=False)
+    for k in list(batch[0].targets.keys()):
+        targets[k] = torch.stack([s.targets[k] for s in batch])
+
+    return DotMap(
+        frames=frames,
+        auxs=DotMap(events=events, counts=counts, _dynamic=False),
+        targets=targets,
+        recording=[s.recording for s in batch],
+        K_rect=torch.stack([s.K_rect for s in batch]),
+        inv_K_rect=torch.stack([s.inv_K_rect for s in batch]),
+        _dynamic=False,
+    )
 
 
 class MvsecDataModule(LightningDataModule):
@@ -410,7 +444,8 @@ class MvsecDataModule(LightningDataModule):
                 seq = train_sequence(recording=r, time=t)
                 train_recordings.extend([rec] * int(seq.rec_duration / seq.seq_duration))
             self.train_dataset = ConcatDataset([train_sequence(recording=r, time=t) for r, t in train_recordings])
-            self.train_frame_shape = (self.batch_size, 2, *self.train_dataset.datasets[0].frame_shape)
+            n = self.train_dataset.datasets[0].n_stack
+            self.train_frame_shape = (self.batch_size, 2 * n, *self.train_dataset.datasets[0].frame_shape)
 
         if stage in ["fit", "validate"]:
             val_sequence = partial(
@@ -427,7 +462,8 @@ class MvsecDataModule(LightningDataModule):
                     rec = (rec, None)
                 self.val_recordings[i] = rec
             self.val_dataset = ConcatDataset([val_sequence(recording=r, time=t) for r, t in self.val_recordings])
-            self.val_frame_shape = (1, 2, *self.val_dataset.datasets[0].frame_shape)
+            n = self.val_dataset.datasets[0].n_stack
+            self.val_frame_shape = (1, 2 * n, *self.val_dataset.datasets[0].frame_shape)
 
         elif stage == "test":
             raise NotImplementedError
@@ -435,16 +471,16 @@ class MvsecDataModule(LightningDataModule):
     def train_dataloader(self):
         sampler = ConcatBatchSampler(self.train_dataset, self.batch_size, shuffle=self.shuffle)
         return InfiniteDataLoader(
-            self.train_dataset, batch_sampler=sampler, num_workers=self.num_workers, collate_fn=time_first_collate
+            self.train_dataset, batch_sampler=sampler, num_workers=self.num_workers, collate_fn=_feedforward_collate
         )
 
     def val_dataloader(self):
         return DataLoader(
             self.val_dataset,
-            batch_size=None,
+            batch_size=1,
             shuffle=False,
             num_workers=self.num_workers // 2,
-            collate_fn=only_add_batch_dim,
+            collate_fn=_feedforward_collate,
         )
 
 
