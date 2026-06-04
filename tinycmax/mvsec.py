@@ -118,10 +118,8 @@ class MvsecSequence:
         # start and end time
         if self.seq_len is not None:  # randomly-sliced sequence of seq_len
             start, end = self.t0, max(self.t0, self.tk - (self.seq_len + 1) * self.time_window)  # only full
-            if np.issubdtype(self.fs["events/t"], np.integer):
-                t_start = np.random.randint(start, max(start + 1, end))
-            elif np.issubdtype(self.fs["events/t"], np.floating):
-                t_start = np.random.uniform(start, end)
+            # t0/tk are always int64 microseconds (converted in __post_init__)
+            t_start = np.random.randint(int(start), max(int(start) + 1, int(end)))
             n_full_windows = self.seq_len
         else:  # full sequence
             t_start, t_end = self.t0, self.tk
@@ -249,20 +247,21 @@ class MvsecSequence:
         events_tensor = torch.tensor(events_np)  # [total_count, 4]
         counts_tensor = torch.tensor(total_count)
 
-        # targets — use the last window's depth ground truth
+        # targets — use the last window's flow ground truth
         targets = DotMap(_dynamic=False)
-        if self.gt and "depth" in self.gt:
+        if self.gt and "flow" in self.gt:
             i = chunk[-1]
-            gt_start = bisect_left(self.fs["gt"]["davis/left/depth_image_rect_ts"], self.t_start[i] / 1e6)
-            gt_end = bisect_left(self.fs["gt"]["davis/left/depth_image_rect_ts"], self.t_end[i] / 1e6)
+            # flow_dist_ts is in seconds; t_start/t_end are in microseconds
+            gt_start = bisect_left(self.fs["gt"]["davis/left/flow_dist_ts"], self.t_start[i] / 1e6)
+            gt_end = bisect_left(self.fs["gt"]["davis/left/flow_dist_ts"], self.t_end[i] / 1e6)
             if gt_start >= gt_end:
                 gt_end = gt_start + 1
-            gt_depth_id = gt_start + 1
-            gt_depth = self.fs["gt"]["davis/left/depth_image_rect"][gt_start:gt_end]
-            gt_depth = gt_depth[..., top:bottom, left:right]
-            gt_depth[np.isnan(gt_depth)] = 0
-            targets.depth = torch.from_numpy(gt_depth.astype(np.float32))
-            targets.depth_id = torch.tensor(gt_depth_id)
+            gt_flow_id = gt_start + 1
+            gt_flow = self.fs["gt"]["davis/left/flow_dist"][gt_start:gt_end]  # (n, 2, H, W)
+            gt_flow = gt_flow[..., top:bottom, left:right]
+            gt_flow[np.isnan(gt_flow)] = 0
+            targets.flow = torch.from_numpy(gt_flow.astype(np.float32))
+            targets.flow_id = torch.tensor(gt_flow_id)
 
         # apply augmentations
         fh, fw = frames.shape[1], frames.shape[2]
@@ -342,7 +341,7 @@ def _feedforward_collate(batch):
 
 class MvsecDataModule(LightningDataModule):
 
-    gt = ["depth"]
+    gt = ["flow"]
 
     def __init__(
         self,
