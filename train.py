@@ -1,7 +1,7 @@
 import hydra
 from hydra.utils import instantiate
 from lightning import seed_everything
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 import torch
 import wandb
 
@@ -34,20 +34,21 @@ def main(config):
     logger = instantiate(config.logger)
     if logger is not None:
         logger.log_hyperparams(OmegaConf.to_container(config, resolve=True, throw_on_missing=True))
-        enable_checkpointing = True
     else:
         logger = False
-        enable_checkpointing = False
-        callbacks.pop("checkpoint", None)
+
+    # resume_from_checkpoint is not a Trainer ctor arg in Lightning 2+;
+    # pop it before instantiation and forward to trainer.fit(ckpt_path=...)
+    with open_dict(config.trainer):
+        ckpt_path = config.trainer.pop("resume_from_checkpoint", None)
 
     # trainer and train!
     trainer = instantiate(
         config.trainer,
         logger=logger,
         callbacks=[cb for cb in callbacks.values()],
-        enable_checkpointing=enable_checkpointing,
     )
-    trainer.fit(litmodule, datamodule=datamodule)
+    trainer.fit(litmodule, datamodule=datamodule, ckpt_path=ckpt_path)
 
 
 if __name__ == "__main__":

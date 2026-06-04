@@ -1,4 +1,6 @@
 _target_: lightning.Trainer
+default_root_dir: outputs  # override at runtime: trainer.default_root_dir=/your/path
+resume_from_checkpoint: null  # set to a .ckpt path to resume: trainer.resume_from_checkpoint=/path/to/last.ckpt
 accelerator: gpu
 devices: [0]  # specify which gpu id  to use
 max_epochs: 100

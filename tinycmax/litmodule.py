@@ -94,6 +94,7 @@ class Train(LightningModule):
                     elif stage == "validate":
                         self.log(f"{stage}/{name}/{batch.recording}", value, batch_size=1)
                         self.log(f"{stage}/{name}/mean", value, batch_size=1)
+                        self.log("val_loss", value, batch_size=1, prog_bar=True)
                     if self.visualizing:
                         log[0][name] = value.item()
 
