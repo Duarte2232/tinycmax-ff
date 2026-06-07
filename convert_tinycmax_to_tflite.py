@@ -3,11 +3,10 @@
 Convert tinycmax optical flow model: PyTorch state_dict → ONNX → TF SavedModel → TFLite
 
 Architecture notes:
-  - WrappedFlowNetwork(NetworkWrapper, FlowNetwork)
-  - NetworkWrapper.forward manages GRU hidden state in self.state
-  - FlowNetwork.forward takes {"events": tensor} + explicit hidden, returns ({"flow": tensor}, hidden)
-  - All Conv2d layers are LazyConv2d (need one forward pass before loading weights)
-  - For ONNX export: call FlowNetwork.forward directly with hidden=None (stateless, GRU inits to zeros)
+  - FlowNetwork: feedforward, no recurrent state
+  - Input: [B, 2*N, H, W] — N=5 stacked 2-channel event frames (10 channels total)
+  - Output: [B, 2, H, W] — optical flow (u, v)
+  - LazyConv2d in encoder: needs one forward pass before loading weights
 """
 
 import sys
@@ -19,32 +18,26 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import numpy as np
 import torch
 import torch.nn as nn
-from omegaconf import OmegaConf
-from hydra.utils import instantiate
 from dotmap import DotMap
 
 from tinycmax.network import FlowNetwork
 
 # ── paths ──────────────────────────────────────────────────────────────────
-CKPT_DIR     = PROJECT_ROOT / "checkpoints" / "rb5gp4fv_latest"
-CONFIG_PATH  = CKPT_DIR / "config.yaml"
-WEIGHTS_PATH = CKPT_DIR / "state_dict.pt"
+WEIGHTS_PATH = Path("/content/drive/MyDrive/tinycmax_ff_checkpoints/state_dict.pt")
 ONNX_PATH    = PROJECT_ROOT / "tinycmax.onnx"
 TF_DIR       = PROJECT_ROOT / "tinycmax_tf"
 TFLITE_PATH  = PROJECT_ROOT / "tinycmax_tid.tflite"
 
-INPUT_SHAPE = (1, 2, 192, 344)
-OPSET       = 13
+INPUT_SHAPE  = (1, 10, 192, 344)   # batch=1, 2*N=10 stacked channels, MVSEC resolution
+OUTPUT_SHAPE = (1, 2, 192, 344)    # batch=1, flow (u,v), same spatial dims
+OPSET        = 13
 
 
 # ── ONNX export wrapper ────────────────────────────────────────────────────
 class ExportWrapper(nn.Module):
     """
-    Thin wrapper that:
-    - accepts a plain events tensor instead of a DotMap
-    - calls FlowNetwork.forward directly (bypasses NetworkWrapper's stateful forward)
-    - passes hidden=None so the GRU initialises to zeros each call (stateless export)
-    - returns only the flow tensor
+    Thin wrapper that accepts a plain events tensor instead of a DotMap
+    and returns only the flow tensor, for clean ONNX tracing.
     """
 
     def __init__(self, network: nn.Module):
@@ -52,7 +45,7 @@ class ExportWrapper(nn.Module):
         self.network = network
 
     def forward(self, events: torch.Tensor) -> torch.Tensor:
-        out, _ = FlowNetwork.forward(self.network, {"events": events}, None)
+        out = FlowNetwork.forward(self.network, {"events": events})
         return out["flow"]
 
 
@@ -62,18 +55,23 @@ def load_network() -> nn.Module:
     print("Step 1: Load network")
     print("─" * 55)
 
-    cfg = OmegaConf.load(CONFIG_PATH)
+    print("  Instantiating FlowNetwork (feedforward, 10-channel input) ...")
+    net = FlowNetwork(
+        encoder_channels=64,
+        memory_channels=64,
+        decoder_channels=64,
+        activation_fn=nn.ReLU,
+        final_bias=True,
+        padding_mode="reflect",
+        scaling=32,
+    )
 
-    print("  Instantiating WrappedFlowNetwork from config ...")
-    net = instantiate(cfg.network)
-
-    # LazyConv2d layers have no weight until the first forward pass
+    # LazyConv2d in the encoder has no weight until the first forward pass
     print("  Initialising lazy layers with dummy forward pass ...")
     net.eval()
     dummy_dm = DotMap({"events": torch.zeros(*INPUT_SHAPE)}, _dynamic=False)
     with torch.no_grad():
         net(dummy_dm)
-    net.reset_state()
 
     print("  Loading state dict ...")
     sd = torch.load(WEIGHTS_PATH, map_location="cpu", weights_only=True)
@@ -101,7 +99,7 @@ def export_onnx(net: nn.Module) -> Path:
     with torch.no_grad():
         ref = wrapper(dummy)
     print(f"  Wrapper reference output shape : {tuple(ref.shape)}")
-    assert tuple(ref.shape) == INPUT_SHAPE, f"Expected {INPUT_SHAPE}, got {ref.shape}"
+    assert tuple(ref.shape) == OUTPUT_SHAPE, f"Expected {OUTPUT_SHAPE}, got {ref.shape}"
 
     print(f"  Tracing and exporting (opset {OPSET}) ...")
     with torch.no_grad():
@@ -217,8 +215,8 @@ def verify_tflite(tflite_path: Path) -> None:
 
     print(f"  Inference output shape: {list(result.shape)}")
 
-    # Verify spatial dims and channel count match the original PyTorch spec
-    n, c, h, w = INPUT_SHAPE
+    # Verify spatial dims and channel count match the flow output spec
+    n, c, h, w = OUTPUT_SHAPE
     assert list(result.shape) == [n, h, w, c], (
         f"Unexpected output shape: got {list(result.shape)}, expected [{n}, {h}, {w}, {c}] (NHWC)"
     )
