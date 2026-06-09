@@ -194,28 +194,41 @@ def saved_model_to_tflite_int8(tf_dir: Path) -> Path:
     import tensorflow as tf
 
     def representative_dataset():
-        import sys
-        sys.path.insert(0, str(PROJECT_ROOT))
-        from tinycmax.mvsec import MvsecSequence
-        from torch.utils.data import DataLoader
+        import h5py
+        import hdf5plugin
 
-        dataset = MvsecSequence(
-            root_dir="/content/tinycmax/data/mvsec",
-            recording="outdoor_day1",
-            time_window=0.05,
-            count_window=None,
-            n_stack=5,
-        )
-        loader = DataLoader(dataset, batch_size=1, shuffle=True)
-        count = 0
-        for batch in loader:
-            if count >= 200:
-                break
-            events = batch["events"].numpy()  # (1, 10, 192, 344) NCHW
-            events_nhwc = events.transpose(0, 2, 3, 1).astype(np.float32)  # (1, 192, 344, 10)
-            yield [events_nhwc]
-            count += 1
-        print(f"  Calibration: used {count} real MVSEC samples")
+        data_path = "/content/tinycmax/data/mvsec/outdoor_day/outdoor_day1_data.hdf5"
+
+        with h5py.File(data_path, "r") as f:
+            events_data = f['davis']['left']['events']  # (N, 4): x, y, t, p
+            total_events = len(events_data)
+
+            chunk_size = total_events // 200
+
+            for i in range(200):
+                start = i * chunk_size
+                end = start + chunk_size
+                chunk = events_data[start:end]  # (chunk_size, 4)
+
+                sample = np.zeros((1, 192, 344, 10), dtype=np.float32)
+                xs = np.clip(chunk[:, 0].astype(np.int32), 0, 343)
+                ys = np.clip(chunk[:, 1].astype(np.int32), 0, 191)
+                ps = chunk[:, 3].astype(np.int32)
+
+                bin_size = len(chunk) // 5
+                for b in range(5):
+                    b_start = b * bin_size
+                    b_end = b_start + bin_size
+                    bxs = xs[b_start:b_end]
+                    bys = ys[b_start:b_end]
+                    bps = ps[b_start:b_end]
+                    pos_mask = bps == 1
+                    neg_mask = bps == 0
+                    np.add.at(sample[0, :, :, b*2],   (bys[pos_mask], bxs[pos_mask]), 1.0)
+                    np.add.at(sample[0, :, :, b*2+1], (bys[neg_mask], bxs[neg_mask]), 1.0)
+
+                sample = np.clip(sample, 0, 1)
+                yield [sample]
 
     converter = tf.lite.TFLiteConverter.from_saved_model(str(tf_dir))
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
