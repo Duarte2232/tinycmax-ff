@@ -23,14 +23,14 @@ from dotmap import DotMap
 from tinycmax.network import FlowNetwork
 
 # ── paths ──────────────────────────────────────────────────────────────────
-WEIGHTS_PATH = Path("/content/drive/MyDrive/tinycmax_ff_checkpoints/state_dict.pt")
+WEIGHTS_PATH = Path("state_dict.pt")
 ONNX_PATH    = PROJECT_ROOT / "tinycmax.onnx"
 TF_DIR            = PROJECT_ROOT / "tinycmax_tf"
 TFLITE_PATH       = PROJECT_ROOT / "tinycmax_ff.tflite"
 TFLITE_QUANT_PATH = PROJECT_ROOT / "tinycmax_ff_int8.tflite"
 
 INPUT_SHAPE  = (1, 10, 192, 344)   # batch=1, 2*N=10 stacked channels, MVSEC resolution
-OUTPUT_SHAPE = (1, 2, 192, 344)    # batch=1, flow (u,v), same spatial dims
+OUTPUT_SHAPE = (1, 2, 24, 43)   # 1/8 resolution, upsample done on-board    # batch=1, flow (u,v), same spatial dims
 OPSET        = 13
 
 
@@ -63,7 +63,7 @@ def load_network() -> nn.Module:
         decoder_channels=64,
         activation_fn=nn.ReLU,
         final_bias=True,
-        padding_mode="reflect",
+        padding_mode="zeros",   # changed from "reflect"
         scaling=32,
     )
 
@@ -90,8 +90,11 @@ def export_onnx(net: nn.Module) -> Path:
     print("─" * 55)
     print("Step 2: Export to ONNX")
     print("─" * 55)
+    # Remove bilinear upsample - not supported on N6, will do in MicroPython
+    net.decoder.dec2 = torch.nn.Identity()
 
     wrapper = ExportWrapper(net)
+    
     wrapper.eval()
 
     dummy = torch.zeros(*INPUT_SHAPE)
@@ -190,13 +193,29 @@ def saved_model_to_tflite_int8(tf_dir: Path) -> Path:
 
     import tensorflow as tf
 
-    # NHWC representative dataset: 200 random samples, shape [1, H, W, C]
-    _, h, w, c_in = 1, 192, 344, 10   # NHWC equivalent of INPUT_SHAPE (1, 10, 192, 344)
-
     def representative_dataset():
-        for _ in range(200):
-            sample = np.random.randn(1, h, w, c_in).astype(np.float32)
-            yield [sample]
+        import sys
+        sys.path.insert(0, str(PROJECT_ROOT))
+        from tinycmax.mvsec import MvsecSequence
+        from torch.utils.data import DataLoader
+
+        dataset = MvsecSequence(
+            root_dir="/content/tinycmax/data/mvsec",
+            recording="outdoor_day1",
+            time_window=0.05,
+            count_window=None,
+            n_stack=5,
+        )
+        loader = DataLoader(dataset, batch_size=1, shuffle=True)
+        count = 0
+        for batch in loader:
+            if count >= 200:
+                break
+            events = batch["events"].numpy()  # (1, 10, 192, 344) NCHW
+            events_nhwc = events.transpose(0, 2, 3, 1).astype(np.float32)  # (1, 192, 344, 10)
+            yield [events_nhwc]
+            count += 1
+        print(f"  Calibration: used {count} real MVSEC samples")
 
     converter = tf.lite.TFLiteConverter.from_saved_model(str(tf_dir))
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
