@@ -194,28 +194,11 @@ def saved_model_to_tflite_int8(tf_dir: Path) -> Path:
     import tensorflow as tf
 
     def representative_dataset():
-        import sys
-        sys.path.insert(0, str(PROJECT_ROOT))
-        from tinycmax.mvsec import MvsecSequence
-        from torch.utils.data import DataLoader
-
-        dataset = MvsecSequence(
-            root_dir="/content/tinycmax/data/mvsec",
-            recording="outdoor_day1",
-            time_window=0.05,
-            count_window=None,
-            n_stack=5,
-        )
-        loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
-        count = 0
-        for batch in loader:
-            if count >= 50:
-                break
-            events = batch["events"].numpy()
-            events_nhwc = events.transpose(0, 2, 3, 1).astype(np.float32)
-            yield [events_nhwc]
-            count += 1
-        print(f"  Calibration: used {count} real MVSEC samples")
+        import numpy as np
+        samples = np.load(str(PROJECT_ROOT / "calib_samples.npy"))  # (50, 1, 192, 344, 10)
+        print(f"  Calibration: loaded {len(samples)} real MVSEC samples")
+        for s in samples:
+            yield [s]
 
     converter = tf.lite.TFLiteConverter.from_saved_model(str(tf_dir))
     converter.optimizations = [tf.lite.Optimize.DEFAULT]

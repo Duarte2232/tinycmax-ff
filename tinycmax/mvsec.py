@@ -361,6 +361,7 @@ class MvsecDataModule(LightningDataModule):
         shuffle,
         num_workers,
         download,
+        n_stack=5,
     ):
         super().__init__()
 
@@ -378,6 +379,7 @@ class MvsecDataModule(LightningDataModule):
         self.shuffle = shuffle
         self.num_workers = num_workers
         self.download = download
+        self.n_stack = n_stack
 
     def prepare_data(self):
         if self.download:
@@ -436,6 +438,7 @@ class MvsecDataModule(LightningDataModule):
                 crop=self.train_crop,
                 rectify=self.rectify,
                 augmentations=self.augmentations,
+                n_stack=self.n_stack,
             )
             train_recordings = []
             for rec in self.train_recordings:
@@ -457,6 +460,7 @@ class MvsecDataModule(LightningDataModule):
                 crop=self.val_crop,
                 rectify=True,
                 gt=self.gt,
+                n_stack=self.n_stack,
             )
             for i, rec in enumerate(self.val_recordings):
                 if isinstance(rec, str):
