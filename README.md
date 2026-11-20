@@ -1,3 +1,27 @@
+# TinyCMax, feedforward variant for the STM32N6 NPU (fork)
+
+> **Fork of [Huizerd/tinycmax](https://github.com/Huizerd/tinycmax)** (TU Delft). The method and the original code are the upstream authors' work, and their history and authorship are kept intact. The upstream README follows below, unchanged. This `feedforward` branch is my variant. The original recurrent (GRU) model, with a few small fixes, is on the `main` branch.
+
+## What this fork adds
+
+- **Feedforward network** (no recurrent state): input is 5 stacked 2-channel event frames (10 channels, 192x344, MVSEC resolution); output is the flow map at 1/8 resolution (24x43), with the upsampling left to the board.
+- **Export pipeline** `convert_tinycmax_to_tflite.py`: PyTorch, then ONNX (opset 13), then TensorFlow SavedModel, then TFLite, in float and in int8 (post-training quantization with a representative dataset). Files in the repo: `state_dict.pt` (0.7 MB), `tinycmax_ff.tflite` (707 KB), `tinycmax_ff_int8.tflite` (194 KB).
+- **Training and loader fixes**: resume from checkpoint, MVSEC loader matched to the actual HDF5 format, last incomplete batch dropped, training seed settable from the command line, logger calls guarded for non-wandb loggers.
+
+## Status
+
+No accuracy or latency result is reported in this repository yet: the float-versus-int8 error on MVSEC and the inference time on the NPU have not been written up here. The int8 step needs `calib_samples.npy` (50 calibration windows, shape `(50, 1, 192, 344, 10)`), which is not included.
+
+## Run
+
+```bash
+python convert_tinycmax_to_tflite.py   # needs state_dict.pt; the int8 step also needs calib_samples.npy
+```
+
+Upstream has no licence file. This is a GitHub fork of a public repository and keeps the upstream history and authorship.
+
+---
+
 # TinyCMax
 
 |   Warping  |                             Events, flow, accumulated events, image of warped events       |
